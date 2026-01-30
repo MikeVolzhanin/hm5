@@ -1,134 +1,116 @@
 #!/usr/bin/env python3
 """
-HeadHunter CSV Data Processor
-Использует паттерн "Цепочка ответственности" для обработки данных
+HH CSV preprocessing pipeline (Chain of Responsibility) -> x_data.npy, y_data.npy
+
+Usage:
+    python app.py --input hh.csv --outdir data/processed --chunksize 50000 --drop-missing-target
+
+Output (in outdir):
+  - x_data.npy  (float32, shape [n_rows, n_features])
+  - y_data.npy  (float32, shape [n_rows])
+
+Notes:
+- Designed for large CSV: runs in 2 passes.
+  1) Fit categorical encoders + count rows after filtering
+  2) Transform and write to .npy via numpy.open_memmap (no full dataset in RAM)
 """
+from __future__ import annotations
 
 import argparse
-import pandas as pd
-import numpy as np
+import logging
 from pathlib import Path
-import sys
 
-from config import config
-from pipeline.pipeline_factory import PipelineFactory
-
-
-def validate_file(file_path: str) -> bool:
-    """Проверить существование файла"""
-    path = Path(file_path)
-    if not path.exists():
-        print(f"❌ Файл не найден: {file_path}")
-        return False
-    if not path.suffix.lower() == '.csv':
-        print(f"❌ Файл должен быть в формате CSV: {file_path}")
-        return False
-    return True
+from src.encoding.encoders import FitState
+from src.io.readers import iter_csv_chunks
+from src.io.writers import NpyWriter
+from src.pipeline.builder import build_pipeline
 
 
-def load_data(file_path: str) -> pd.DataFrame:
-    """Загрузить данные из CSV файла"""
-    try:
-        # Пробуем разные кодировки
-        encodings = ['utf-8', 'cp1251', 'latin1']
-        
-        for encoding in encodings:
-            try:
-                df = pd.read_csv(file_path, encoding=encoding, low_memory=False)
-                print(f"✓ Файл загружен с кодировкой {encoding}")
-                return df
-            except UnicodeDecodeError:
-                continue
-        
-        # Если ни одна кодировка не подошла
-        raise ValueError("Не удалось определить кодировку файла")
-        
-    except Exception as e:
-        print(f"❌ Ошибка при загрузке файла: {e}")
-        sys.exit(1)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="HH CSV preprocessing -> x_data.npy, y_data.npy")
+    p.add_argument("--input", "-i", required=True, help="Path to hh.csv")
+    p.add_argument("--outdir", "-o", default="data/processed", help="Directory to write outputs")
+    p.add_argument("--chunksize", "-c", type=int, default=50_000, help="Rows per chunk")
+    p.add_argument("--encoding", default=None, help="Force CSV encoding (optional)")
+    p.add_argument("--delimiter", default=None, help="Force delimiter (optional)")
+    p.add_argument("--target", default="salary_rub", help="Target column after parsing (default: salary_rub)")
+    p.add_argument("--drop-missing-target", action="store_true", help="Drop rows where target is missing")
+    p.add_argument("--loglevel", default="INFO", help="Logging level")
+    return p.parse_args()
 
 
-def main():
-    """Основная функция приложения"""
-    
-    # Настройка парсера аргументов
-    parser = argparse.ArgumentParser(
-        description='HeadHunter CSV Data Processor',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Примеры использования:
-  python app.py hh.csv
-  python app.py /path/to/hh.csv
-        """
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.loglevel.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    
-    parser.add_argument(
-        'csv_path',
-        type=str,
-        help='Путь к CSV файлу с данными HeadHunter'
-    )
-    
-    parser.add_argument(
-        '--encoding',
-        type=str,
-        default='auto',
-        help='Кодировка файла (utf-8, cp1251, latin1)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Валидация файла
-    if not validate_file(args.csv_path):
-        sys.exit(1)
-    
-    print("=" * 60)
-    print("HeadHunter Data Processor")
-    print("=" * 60)
-    
-    # Загрузка данных
-    print("\n📥 Загрузка данных...")
-    df = load_data(args.csv_path)
-    
-    print(f"   Загружено {len(df)} строк, {len(df.columns)} колонок")
-    print(f"   Колонки: {', '.join(df.columns.tolist())}")
-    
-    # Проверка целевой колонки
-    if config.TARGET_COLUMN not in df.columns:
-        print(f"❌ Целевая колонка '{config.TARGET_COLUMN}' не найдена в данных")
-        print(f"   Доступные колонки: {', '.join(df.columns.tolist())}")
-        sys.exit(1)
-    
-    # Создание пайплайна
-    print("\n🔧 Создание пайплайна обработки...")
-    pipeline = PipelineFactory.create_pipeline()
-    print(f"   Цепочка обработчиков: {pipeline}")
-    
-    # Обработка данных
-    print("\n⚙️  Обработка данных...")
-    try:
-        X_processed, y = pipeline.handle(df)
-        
-        # Удаляем строки с пропущенными значениями в целевой переменной
-        valid_indices = ~np.isnan(y)
-        X_processed = X_processed[valid_indices]
-        y = y[valid_indices]
-        
-        print(f"   После очистки: {len(X_processed)} строк")
-        print(f"   Признаков после обработки: {X_processed.shape[1]}")
-        
-        # Сохранение результатов
-        print("\n💾 Сохранение результатов...")
-        PipelineFactory.save_results(X_processed, y)
-        
-    except Exception as e:
-        print(f"❌ Ошибка при обработке данных: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    print("\n✅ Обработка завершена успешно!")
-    print("=" * 60)
+    log = logging.getLogger("app")
+
+    input_path = Path(args.input).expanduser().resolve()
+    outdir = Path(args.outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    pipeline = build_pipeline(target=args.target, drop_missing_target=args.drop_missing_target)
+
+    # -------- pass 1: fit encoders + count rows --------
+    fit = FitState()
+
+    total_in = 0
+    total_kept = 0
+    feature_names: list[str] | None = None
+
+    for chunk in iter_csv_chunks(
+        input_path=input_path,
+        chunksize=args.chunksize,
+        encoding=args.encoding,
+        delimiter=args.delimiter,
+    ):
+        total_in += len(chunk)
+        ctx = pipeline.process_chunk(chunk)
+
+        if ctx.X is None or ctx.y is None:
+            continue
+
+        if feature_names is None:
+            feature_names = list(ctx.X.columns)
+            fit.init_columns(feature_names)
+
+        # Fit categorical mappings incrementally
+        fit.fit_chunk(ctx.X)
+
+        total_kept += len(ctx.X)
+
+    if feature_names is None:
+        raise RuntimeError("No data produced by pipeline. Check input/filters/target parsing.")
+
+    log.info("Pass1 done. Read rows=%s, kept rows=%s, n_features=%s", total_in, total_kept, len(feature_names))
+
+    # -------- pass 2: transform + write to npy memmaps --------
+    writer = NpyWriter(outdir=outdir, n_rows=total_kept, feature_names=feature_names)
+
+    offset = 0
+    for chunk in iter_csv_chunks(
+        input_path=input_path,
+        chunksize=args.chunksize,
+        encoding=args.encoding,
+        delimiter=args.delimiter,
+    ):
+        ctx = pipeline.process_chunk(chunk)
+        if ctx.X is None or ctx.y is None:
+            continue
+
+        X_arr, y_arr = fit.transform_chunk(ctx.X, ctx.y, feature_names=feature_names)
+        writer.write(offset=offset, X_arr=X_arr, y_arr=y_arr)
+        offset += X_arr.shape[0]
+
+    writer.close()
+
+    log.info("Done. Wrote rows=%s into %s", offset, outdir)
+    log.info("Files: %s, %s", (outdir / "x_data.npy"), (outdir / "y_data.npy"))
+    log.info("Feature names saved to: %s", (outdir / "feature_names.txt"))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
